@@ -1,0 +1,1638 @@
+---
+title: "Mobile_mRNA_Grapevine"
+format: html
+editor: visual
+---
+# Setup
+
+```{r}
+library(GenomicRanges)
+library(GenomicAlignments)
+library(GenomicFeatures)
+library(rtracklayer)
+library(magrittr)
+library(plyr)
+library(reshape2)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(tidyverse)
+library(biomaRt)
+library(Rsamtools)
+library(data.table)
+library(GeneOverlap)
+library(readxl)
+library(ggVennDiagram)
+library(ggplot2)
+library(clusterProfiler)
+library(writexl)
+library(GO.db)
+```
+
+#==========================
+# Section 1. Mapping workflow:
+#==========================
+
+```{Linux Phoenix HPC}
+1.  Shiraz + PN T2T + Rug meta-Genome
+
+cat *.fasta > Shiraz_PN_RUG_metagenome.fasta
+cat T2T*.fasta > Vvinifera_T2Tv5_combined.fasta
+cat *_140Ruggeri.fasta> Rug_cat_meta.fasta
+cat SHZ_1654_*.fasta> SHZ_cat_meta.fasta
+
+2.  Trimming
+AdapterRemoval \
+    --file1 "$R1_FILE" \
+    --file2 "$R2_FILE" \
+    --basename "$OUTPUT_BASENAME" \
+    --minlength 100 \
+    --trimns \
+    --trimqualities \
+    --gzip \
+    --output1 "${OUTPUT_BASENAME}.R1.trimmed.fq.gz" \
+    --output2 "${OUTPUT_BASENAME}.R2.trimmed.fq.gz" \
+    --singleton "${OUTPUT_BASENAME}.singleton.trimmed.fq.gz"
+
+3.  Default alignment + allbestscore
+STAR --runMode genomeGenerate \
+--runThreadN 8 \
+--genomeDir "$GENOME_INDEX_DIR" \
+--genomeFastaFiles "Shiraz_PN_RUG_metagenome.fasta" \
+--genomeSAindexNbases 14
+
+STAR --genomeDir "$GENOME_INDEX_DIR" \
+--runThreadN "$SLURM_CPUS_PER_TASK" \
+--readFilesIn "$R1_FILE" "$R2_FILE" \
+--readFilesCommand zcat \
+--alignIntronMax 50000 \
+--alignMatesGapMax 10000 \
+--outFileNamePrefix "${ALIGNMENT_DIR}/${sample_name}_" \
+--outSAMtype BAM SortedByCoordinate \
+--outSAMprimaryFlag AllBestScore \
+--outFilterType BySJout \
+--alignIntronMin 20 \
+--alignSJoverhangMin 8 \
+--alignSJDBoverhangMin 1 \
+--sjdbScore 1
+samtools view -b -@ 8 -F 260 -o "$OUTPUT_BAM" "$INPUT_BAM"
+
+4.  Filter out primary alignment in both genotypes
+samtools view -L "$VITIS_BED" "$INPUT_BAM" | cut -f1 | sort | uniq > "${TEMP_DIR}/vitis_reads.txt" || { echo "Error: Failed to create Vitis reads list." >&2; exit 1; }
+echo "Finding reads that align to Ruggeri chromosomes..."
+
+samtools view -L "$RUGGERI_BED" "$INPUT_BAM" | cut -f1 | sort | uniq > "${TEMP_DIR}/ruggeri_reads.txt" || { echo "Error: Failed to create Ruggeri reads list." >&2; exit 1; }
+echo "Finding the intersection of reads that align to BOTH genomes..."
+
+comm -12 "${TEMP_DIR}/vitis_reads.txt" "${TEMP_DIR}/ruggeri_reads.txt" > "${TEMP_DIR}/both_alignments_reads.txt" || { echo "Error: Failed to find intersection." >&2; exit 1; }
+echo "Filtering out reads that align to BOTH genomes from the input BAM..."
+
+samtools view -@ "$SLURM_CPUS_PER_TASK" -b -o /dev/null -U "$OUTPUT_BAM" -N "${TEMP_DIR}/both_alignments_reads.txt" "$INPUT_BAM"
+
+# Separate Bam file into SHZ and RUG genome. No read mapped to PN T2T genome used in downstream, we utilize PN T2T as a filler and netting out the reads mapped to the assembly gaps to SHZ and RUG genomes. We do not know which these reads from, so we should discard them. 
+# The -L flag explicitly grabs only the contigs in the Shiraz BED. PN and Ruggeri are dropped.
+samtools view -@ "$SLURM_CPUS_PER_TASK" -b -L "$SHZ_BED_FILE" "$CURRENT_BAM" > "$OUTPUT_SHZ"
+
+# The -L flag explicitly grabs only the contigs in the Ruggeri BED. PN and Shiraz are dropped.
+samtools view -@ "$SLURM_CPUS_PER_TASK" -b -L "$RUG_BED_FILE" "$CURRENT_BAM" > "$OUTPUT_RUG"
+```
+5.  Filter out genome positions that covered by all Self-grafted samples
+```{Linux}
+# Create Shiraz self-graft blacklist
+#B = Bud, L = Leaf, PY = Phloem, R = Root
+TISSUES=("B" "L" "PY" "R")
+
+for TISSUE in "${TISSUES[@]}"; do
+    
+    echo "Processing Tissue Group: SS${TISSUE}"
+    
+    # Dynamically grab the 4 replicates for the current tissue
+    TISSUE_BAMS="${BAM_DIR}/SS${TISSUE}1_PrimaryMapped.bam ${BAM_DIR}/SS${TISSUE}2_PrimaryMapped.bam ${BAM_DIR}/SS${TISSUE}3_PrimaryMapped.bam ${BAM_DIR}/SS${TISSUE}4_PrimaryMapped.bam"
+    
+    # Define the specific output file for this tissue
+    OUTPUT_BED="${OUTPUT_DIR}/Final_SS_${TISSUE}_Background_Blacklist.bed"
+    echo "Calculating absolute genome coverage intervals for SS${TISSUE}..."
+    
+    # The GENOMECOV pipeline: Mathematically calculates coverage, ignoring CIGAR complexity.
+    samtools merge -u -@ "$SLURM_CPUS_PER_TASK" - $TISSUE_BAMS | \
+    bedtools genomecov -ibam stdin -bga -split | \
+    awk '$4>0 {print $1"\t"$2"\t"$3}' | \
+    bedtools merge -i - > "$OUTPUT_BED"    
+    echo "Blacklist successfully created at: $OUTPUT_BED"
+    echo "--------------------------------------------------------"
+done
+echo "All tissue-specific blacklists generated successfully!"
+
+# Filter out SR same genome position covered by Shiraz self-graft bedtools position
+
+bedtools intersect -v -split -a "$CURRENT_BAM" -b "$BLACKLIST" | \
+samtools sort -@ "$SLURM_CPUS_PER_TASK" -o "$CLEAN_BAM"
+samtools index -@ "$SLURM_CPUS_PER_TASK" "$CLEAN_BAM"
+
+6.  Count exon expression: 1 reads per gene
+featureCounts \
+  -T "$SLURM_CPUS_PER_TASK" \
+  -p \
+  -M \
+  --fraction \
+  -t exon \
+  -g gene_id \
+  -a "$ANNOTATION_GTF" \
+  -o "$OUTPUT_MATRIX" \
+  "$BAM_DIR"/*_Cleaned.bam
+
+7.  In primary alignment, count TPM of mobile genes > 1 in R
+```
+ 
+# Load Gene annotations
+```{r}
+# Rug
+Rug_gene.info.from.gff <- read_delim("E:/RNAseq_SR/Reference_genome/Annotation/140Ruggeri_Combined.gtf", delim = "\t", col_names = FALSE) %>% 
+  dplyr::select(X1,X4,X5,X9,X7,X3) %>%
+  set_colnames(c("gene.chr", "gene.start", "gene.end", "gene.id", "gene.strand", "gene.biotype")) %>%
+  mutate(across(2:3, as.numeric)) %>%
+  arrange(gene.chr, gene.start) %>%
+  na.omit()
+
+Rug_exon_gff <- Rug_gene.info.from.gff %>%
+  filter(gene.biotype == "exon") %>%
+  mutate(gene.id = str_extract(gene.id, '(?<=gene_id ")[^"]+')) %>%
+  arrange(gene.chr, gene.end)
+
+Rug_gene <- Rug_gene.info.from.gff %>%
+  filter(gene.biotype == "gene") %>%
+  arrange(gene.chr, gene.end)
+
+# T2T
+T2T_gene.info.from.gff <- rtracklayer::import("E:/RNAseq_SR/Reference_genome/Annotation/PN40024_5.1_on_T2T_ref_with_names.gff3") %>%
+  as.data.frame()
+
+T2T_gene <- T2T_gene.info.from.gff %>%
+  filter(type == "gene") %>%
+  mutate(across(where(is.list), ~ sapply(., paste, collapse = ","))) %>%
+  dplyr::select(where(~ !all(is.na(.) | as.character(.) == "" | as.character(.) == "character(0)"))) %>%
+  dplyr::select(c("seqnames", "start", "end", "strand", "type", "ID" )) %>%
+  set_colnames(c("Chr", "start", "end", "strand", "type", "gene.id" ))%>%
+  mutate(
+    gene.id = str_remove(gene.id, "^(gene:|CDS:|transcript:)"),
+    gene.id = str_remove(gene.id, "(\\.\\d+|_t\\d+.*)$")
+  )
+
+T2T_exon_gff <- T2T_gene.info.from.gff %>%
+  filter(gene.biotype == "exon") %>%
+  mutate(gene.id = str_extract(gene.id, '(?<=gene_id ")[^"]+')) %>%
+  arrange(gene.chr, gene.end)
+
+
+# SHZ
+SHZ_gene.info.from.gff <- read_delim("F:/PhD_Research/2nd_Chapter_Mobile_RNA/Reference_genomes/Annotations/Final_annotations/SHZ_1654_combined_annotation.gff3", delim = "\t", col_names = FALSE) %>%
+  filter(!str_starts(X1, "f?#")) %>%
+  separate(
+    col = X1,
+    into = c("gene.chr", "source", "gene.biotype", "gene.start", "gene.end", "score", "gene.strand", "phase", "gene.id"),
+    sep = "\t",
+    extra = "merge", 
+    fill = "right" 
+  )%>%
+  dplyr::select("gene.chr", "gene.start", "gene.end", "gene.id", "gene.strand", "gene.biotype") %>%
+  mutate(gene.id= str_extract(gene.id, "(?<=ID=)[^;]+"),
+         across(2:3, as.numeric)) %>%
+  arrange(gene.chr, gene.start) %>%
+  na.omit()
+SHZ_gene <- SHZ_gene.info.from.gff %>%
+  filter(gene.biotype == "gene") %>%
+  arrange(gene.chr, gene.end)
+```
+# Cleanup annotation
+```{r}
+# Make sure the annotation is one gene on one contig
+Rug_gene_gff <- Rug_gene.info.from.gff %>%
+  filter(gene.biotype == "gene") %>%
+  arrange(gene.chr, gene.end)
+
+# Assuming your gene identifier column is named 'gene.id'
+# (Change 'gene.id' to your actual column name if it's different)
+
+problem_genes <- Rug_gene_gff %>%
+  # Group by the unique gene identifier
+  group_by(gene.id) %>%
+  
+  # Summarize to count the number of UNIQUE chromosomes/contigs for that gene
+  summarize(
+    unique_contig_count = n_distinct(gene.chr),
+    contigs_listed = paste(unique(gene.chr), collapse = ", ") # Optional: lists the specific contigs
+  ) %>%
+  
+  # Filter to only show genes that map to more than 1 contig
+  filter(unique_contig_count > 1)
+
+# Check the results
+if(nrow(problem_genes) == 0) {
+  print("Success: All genes map to exactly one contig.")
+} else {
+  print(paste("Warning: Found", nrow(problem_genes), "genes mapping to multiple contigs."))
+  print(problem_genes)
+}
+```
+
+# Count source tissue reads from .clean.bam files for source reads (featureCounts)
+
+```{Linux}
+cd /mnt/e/RNAseq_SR/Default_Mapping_FilterOut_Primary_inBoth/Final_Clean/Cleaned_RSScion_SRR_BAMs/
+featureCounts" "-T" "16" "-p" "-M" "--fraction" "-t" "exon" "-g" "gene_id" "-a" "merged_Shiraz.gtf" "-o" "Cleaned_RSS_SRR_Mobile_Counts.txt" "*_Cleaned.bam"
+
+cd /mnt/e/RNAseq_SR/Default_Mapping_FilterOut_Primary_inBoth/Final_Clean/Cleaned_SRScion_RSR_BAMs/
+featureCounts" "-T" "16" "-p" "-M" "--fraction" "-t" "exon" "-g" "gene_id" "-a" "140Ruggeri_Combined.gtf" "-o" "Cleaned_SRS_RSR_Mobile_Counts.txt" "*_Cleaned.bam"
+```
+
+#==========================
+# Section 2. Filter read counts from heterografted samples:
+#==========================
+# Shiraz-Ruggeri samples
+## Scion
+### Load Scion mobile RNA counts
+```{r}
+Mob_SR_scion_to_Rug_raw_counts <- read.table("Cleaned_SRS_RSR_Mobile_Counts.txt", 
+                         header = TRUE, 
+                         sep = "\t", 
+                         check.names = FALSE, 
+                         comment.char = "#") %>%
+  dplyr::rename(gene.id = Geneid)
+# 1. Extract just the file name from the long path
+clean_names <- basename(colnames(Mob_SR_scion_to_Rug_raw_counts))
+
+# 2. Delete the "_Cleaned.bam" suffix, leaving only the sample name (like "SRB1")
+clean_names <- gsub("_Cleaned.bam", "", clean_names)
+
+# 3. Apply these new, clean names back to your dataframe
+colnames(Mob_SR_scion_to_Rug_raw_counts) <- clean_names
+
+# separate into tissues:
+Mob_SR_bud_to_Rug_raw_counts <- Mob_SR_scion_to_Rug_raw_counts %>%
+  dplyr::select(c("gene.id","Chr","Start","End","Strand","Length","SRB1","SRB2","SRB3","SRB4"))
+
+Mob_SR_leaf_to_Rug_raw_counts <- Mob_SR_scion_to_Rug_raw_counts %>%
+  dplyr::select(c("gene.id","Chr","Start","End","Strand","Length","SRL1","SRL2","SRL3","SRL4"))
+
+Mob_SR_PY_to_Rug_raw_counts <- Mob_SR_scion_to_Rug_raw_counts %>%
+  dplyr::select(c("gene.id","Chr","Start","End","Strand","Length","SRPY1","SRPY2","SRPY3","SRPY4"))
+```
+
+### filter mobile RNA read in each repeat group
+
+```{r}
+# Update the default parameter to 0.01 so you never accidentally filter out fractions!
+filter_by_reps <- function(df, min_count = 0.01, min_reps = 4) {
+  df %>%
+    filter(rowSums(dplyr::select(., 7:ncol(.)) >= min_count) >= min_reps)
+}
+
+# ---------------------------------------------------------
+# EXAMPLE 1: Keep genes with >0 count in ALL 4 reps
+# ---------------------------------------------------------
+Mob_SR_bud_4reps  <- filter_by_reps(Mob_SR_bud_to_Rug_raw_counts,  min_count = 0.01, min_reps = 4)
+Mob_SR_leaf_4reps <- filter_by_reps(Mob_SR_leaf_to_Rug_raw_counts, min_count = 0.01, min_reps = 4)
+Mob_SR_PY_4reps   <- filter_by_reps(Mob_SR_PY_to_Rug_raw_counts,   min_count = 0.01, min_reps = 4)
+
+# ---------------------------------------------------------
+# EXAMPLE 2: Keep genes with >0 count in ANY 3 rep 
+# (This is the one you feed into your 50% coverage script!)
+# ---------------------------------------------------------
+Mob_SR_bud_3reps  <- filter_by_reps(Mob_SR_bud_to_Rug_raw_counts,  min_count = 0.01, min_reps = 3)
+Mob_SR_leaf_3reps <- filter_by_reps(Mob_SR_leaf_to_Rug_raw_counts, min_count = 0.01, min_reps = 3)
+Mob_SR_PY_3reps   <- filter_by_reps(Mob_SR_PY_to_Rug_raw_counts,   min_count = 0.01, min_reps = 3)
+
+# ---------------------------------------------------------
+# EXAMPLE 3: Keep genes with >0 count in ANY 1 rep 
+# (This is the one you feed into your 50% coverage script!)
+# ---------------------------------------------------------
+Mob_SR_bud_2reps  <- filter_by_reps(Mob_SR_bud_to_Rug_raw_counts,  min_count = 0.01, min_reps = 2)
+Mob_SR_leaf_2reps <- filter_by_reps(Mob_SR_leaf_to_Rug_raw_counts, min_count = 0.01, min_reps = 2)
+Mob_SR_PY_2reps   <- filter_by_reps(Mob_SR_PY_to_Rug_raw_counts,   min_count = 0.01, min_reps = 2)
+
+# ---------------------------------------------------------
+# EXAMPLE 4: Keep genes with >0 count in ANY 1 rep 
+# (This is the one you feed into your 50% coverage script!)
+# ---------------------------------------------------------
+Mob_SR_bud_1reps  <- filter_by_reps(Mob_SR_bud_to_Rug_raw_counts,  min_count = 0.01, min_reps = 1)
+Mob_SR_leaf_1reps <- filter_by_reps(Mob_SR_leaf_to_Rug_raw_counts, min_count = 0.01, min_reps = 1)
+Mob_SR_PY_1reps   <- filter_by_reps(Mob_SR_PY_to_Rug_raw_counts,   min_count = 0.01, min_reps = 1)
+```
+
+### Put all mobile transcript together
+
+```{r}
+filtered_SRS_dfs <- list(
+  "Bud_4_reps"  = Mob_SR_bud_4reps,
+  "Leaf_4_reps" = Mob_SR_leaf_4reps,
+  "PY_4_reps"   = Mob_SR_PY_4reps,
+  "Bud_3_reps"  = Mob_SR_bud_3reps,
+  "Leaf_3_reps" = Mob_SR_leaf_3reps,
+  "PY_3_reps"   = Mob_SR_PY_3reps,
+  "Bud_2_reps"  = Mob_SR_bud_2reps,
+  "Leaf_2_reps" = Mob_SR_leaf_2reps,
+  "PY_2_reps"   = Mob_SR_PY_2reps,
+  "Bud_1_rep"   = Mob_SR_bud_1reps,
+  "Leaf_1_rep"  = Mob_SR_leaf_1reps,
+  "PY_1_rep"    = Mob_SR_PY_1reps
+)
+```
+
+### Export the entire list to one Excel workbook
+
+```{R}
+write_xlsx(filtered_SRS_dfs, path = "Mobility_Filtering_Results_SRS.xlsx")
+```
+
+### extract mobile transcripts exon infor
+
+```{r}
+Rug_gene.info.from.gff <- read_delim("E:/RNAseq_SR/Reference_genome/Annotation/140Ruggeri_Combined.gtf", delim = "\t", col_names = FALSE) %>% 
+  dplyr::select(X1,X4,X5,X9,X7,X3) %>%
+  set_colnames(c("gene.chr", "gene.start", "gene.end", "gene.id", "gene.strand", "gene.biotype")) %>%
+  mutate(across(2:3, as.numeric)) %>%
+  arrange(gene.chr, gene.start) %>%
+  na.omit()
+
+Rug_exon_gff <- Rug_gene.info.from.gff %>%
+  filter(gene.biotype == "exon") %>%
+  mutate(gene.id = str_extract(gene.id, '(?<=gene_id ")[^"]+')) %>%
+  arrange(gene.chr, gene.end)
+
+SRB_mobile_exon_gff <- Rug_exon_gff %>% filter(gene.id %in% Mob_SR_bud_1reps$gene.id)  
+SRL_mobile_exon_gff <- Rug_exon_gff  %>% filter(gene.id %in% Mob_SR_leaf_1reps$gene.id)
+SRPY_mobile_exon_gff <- Rug_exon_gff  %>% filter(gene.id %in% Mob_SR_PY_1reps$gene.id)
+```
+
+### Define function for transcript coverage
+
+```{r}
+# Define the function
+calculate_mobile_coverage <- function(tissue_exon_gff, bam_directory, threshold = 0.70) {
+  
+  message("\n--- Starting analysis for directory: ", bam_directory, " ---")
+  
+  # 1. CLEAN THE EXONS & BUILD THE GRANGES OBJECT
+  mobile_exon_clean <- tissue_exon_gff %>%
+    distinct(gene.chr, gene.start, gene.end, gene.strand, gene.id, .keep_all = TRUE)
+  
+  GRange_exons <- makeGRangesFromDataFrame(
+    mobile_exon_clean,
+    keep.extra.columns = TRUE,
+    seqnames.field = "gene.chr",
+    start.field = "gene.start",
+    end.field = "gene.end",
+    strand.field = "gene.strand",
+    starts.in.df.are.0based = FALSE
+  )
+  
+  # 2. APPLY THE BAM HEADER FIX
+  bamfiles <- list.files(bam_directory, pattern=".bam$", full.names = TRUE)
+  if(length(bamfiles) == 0) stop("No BAM files found in this directory!")
+  
+  bam_header <- scanBamHeader(bamfiles[1])
+  true_bam_lengths <- bam_header[[1]]$targets
+  
+  common_chrs <- intersect(seqlevels(GRange_exons), names(true_bam_lengths))
+  seqlevels(GRange_exons, pruning.mode="coarse") <- common_chrs
+  seqlengths(GRange_exons) <- true_bam_lengths[common_chrs]
+  
+  # 3. LOOP THROUGH REPLICATES TO CALCULATE COVERAGE
+  coverage_results_list <- lapply(bamfiles, function(bamfile) {
+    sample_name <- basename(bamfile)
+    message("  -> Processing: ", sample_name)
+    
+    bam.input <- readGAlignments(bamfile, param = ScanBamParam(which = GRange_exons))
+    bam_coverage <- coverage(bam.input)
+    exon_specific_coverage <- bam_coverage[GRange_exons]
+    
+    exon_results <- as.data.frame(GRange_exons) %>%
+      mutate(
+        covered_bases = sum(exon_specific_coverage > 0),
+        exon_length = width
+      )
+    
+    transcript_coverage <- exon_results %>%
+      group_by(gene.id) %>%
+      summarise(
+        total_covered_bases = sum(covered_bases),
+        total_transcript_length = sum(exon_length),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        percent_coverage = total_covered_bases / total_transcript_length,
+        sample_id = sample_name
+      )
+    
+    rm(bam.input, bam_coverage, exon_specific_coverage)
+    gc()
+    
+    return(transcript_coverage)
+  })
+  
+  # 4. COMBINE AND FILTER THE FINAL RESULTS
+  all_coverage <- bind_rows(coverage_results_list)
+  
+  confident_mobile_genes <- all_coverage %>%
+    filter(percent_coverage >= threshold)
+  
+  message("--- Finished! Found ", nrow(confident_mobile_genes), " confident events. ---\n")
+  return(confident_mobile_genes)
+}
+```
+
+### Calculate transcript coverage by GenomicRange
+
+```{r}
+# 1. Run Scion Leaves (SRL)
+Mobile_RNAs_coverage_length_SRL <- calculate_mobile_coverage(
+  tissue_exon_gff = SRL_mobile_exon_gff, 
+  bam_directory = "E:/RNAseq_SR/Default_Mapping_FilterOut_Primary_inBoth/All_P_alignments/SRL/"
+)
+
+# 2. Run Scion Buds (SRB)
+Mobile_RNAs_coverage_length_SRB <- calculate_mobile_coverage(
+  tissue_exon_gff = SRB_mobile_exon_gff, 
+  bam_directory = "E:/RNAseq_SR/Default_Mapping_FilterOut_Primary_inBoth/All_P_alignments/SRB/"
+)
+
+# 3. Run Scion Phloem/Xylem (SRPY)
+Mobile_RNAs_coverage_length_SRPY <- calculate_mobile_coverage(
+  tissue_exon_gff = SRPY_mobile_exon_gff, 
+  bam_directory = "E:/RNAseq_SR/Default_Mapping_FilterOut_Primary_inBoth/All_P_alignments/SRPY/"
+)
+```
+
+```{r}
+# Save each dataframe as its own CSV file
+write_csv(Mobile_RNAs_coverage_length_SRL, "Mobile_RNAs_coverage_length_SRL.csv")
+write_csv(Mobile_RNAs_coverage_length_SRB, "Mobile_RNAs_coverage_length_SRB.csv")
+write_csv(Mobile_RNAs_coverage_length_SRPY, "Mobile_RNAs_coverage_length_SRPY.csv")
+```
+
+### Filter coverage > 70% 
+
+```{r}
+# ==========================================================
+# 1. PROCESS SCION BUDS (SRB)
+# ==========================================================
+
+# Step A: Pivot the coverage data from long to wide
+SRB_coverage_wide <- Mobile_RNAs_coverage_length_SRB %>%
+  dplyr::select(gene.id, sample_id, percent_coverage) %>%
+  pivot_wider(names_from = sample_id, values_from = percent_coverage)
+
+# Step B: Merge with counts and format the text
+SRB_Final_Table <- Mob_SR_bud_1reps %>%
+  left_join(SRB_coverage_wide, by = "gene.id") %>%
+  # Target only the BAM columns, replace NA with "< 0.7", and leave actual numbers alone
+  mutate(across(ends_with(".bam"), 
+                ~ ifelse(is.na(.), "< 0.7", as.character(round(., 7))))) %>%
+  dplyr::select(gene.id, SRB1, SRB2, SRB3, SRB4, SRB1_PrimaryMapped.bam, SRB2_PrimaryMapped.bam, SRB3_PrimaryMapped.bam, SRB4_PrimaryMapped.bam)
+
+
+# ==========================================================
+# 2. PROCESS SCION LEAVES (RSL)
+# ==========================================================
+
+SRL_coverage_wide <- Mobile_RNAs_coverage_length_SRL %>%
+  dplyr::select(gene.id, sample_id, percent_coverage) %>%
+  pivot_wider(names_from = sample_id, values_from = percent_coverage)
+
+SRL_Final_Table <- Mob_SR_leaf_1reps %>%
+  left_join(SRL_coverage_wide, by = "gene.id") %>%
+  mutate(across(ends_with(".bam"), 
+                ~ ifelse(is.na(.), "< 0.7", as.character(round(., 7))))) %>%
+  dplyr::select(gene.id, SRL1, SRL2, SRL3, SRL4, SRL1_PrimaryMapped.bam, SRL2_PrimaryMapped.bam, SRL3_PrimaryMapped.bam, SRL4_PrimaryMapped.bam)
+
+
+# ==========================================================
+# 3. PROCESS SCION PHLOEM/XYLEM (RSPY)
+# ==========================================================
+
+SRPY_coverage_wide <- Mobile_RNAs_coverage_length_SRPY %>%
+  dplyr::select(gene.id, sample_id, percent_coverage) %>%
+  pivot_wider(names_from = sample_id, values_from = percent_coverage)
+
+SRPY_Final_Table <- Mob_SR_PY_1reps %>%
+  left_join(SRPY_coverage_wide, by = "gene.id") %>%
+  mutate(across(ends_with(".bam"), 
+                ~ ifelse(is.na(.), "< 0.7", as.character(round(., 7))))) %>%
+  dplyr::select(gene.id, SRPY1, SRPY2, SRPY3, SRPY4, SRPY1_PrimaryMapped.bam, SRPY2_PrimaryMapped.bam, SRPY3_PrimaryMapped.bam, SRPY4_PrimaryMapped.bam)
+```
+
+### Mobile RNA as 1. clean reads > 0.01 (as featureCount splice multi-mapper). 2. Length >70%
+
+```{r}
+# 1. Score the replicates by forcing BOTH conditions to be true
+# ==========================================================
+# 2. SCORE AND FILTER SCION LEAVES (SRB)
+# ==========================================================
+SRB_Scored <- SRB_Final_Table %>%
+  mutate(
+    Pass_Rep1 = (SRB1 >= 0.01) & (SRB1_PrimaryMapped.bam != "< 0.7"),
+    
+    # Rep 2 must have > 0.01 counts AND not have failed coverage
+    Pass_Rep2 = (SRB2 >= 0.01) & (SRB2_PrimaryMapped.bam != "< 0.7"),
+    
+    # Rep 3 must have > 0.01 counts AND not have failed coverage
+    Pass_Rep3 = (SRB3 >= 0.01) & (SRB3_PrimaryMapped.bam != "< 0.7"),
+    
+    # Rep 4 must have > 0.01 counts AND not have failed coverage
+    Pass_Rep4 = (SRB4 >= 0.01) & (SRB4_PrimaryMapped.bam != "< 0.7"),
+    
+    # Add the TRUE/FALSE values together (TRUE = 1, FALSE = 0)
+    True_Passed_Reps = Pass_Rep1 + Pass_Rep2 + Pass_Rep3 + Pass_Rep4
+  ) %>%
+  # Drop the temporary Pass columns to keep the table clean
+  dplyr::select(-Pass_Rep1, -Pass_Rep2, -Pass_Rep3, -Pass_Rep4) %>%
+  # Move the final score to the front
+  relocate(True_Passed_Reps, .after = gene.id)
+
+# Extract confident lists
+df1_SRB_1reps <- SRB_Scored %>%
+  filter(True_Passed_Reps >= 1)
+df2_SRB_2reps <- SRB_Scored %>%
+  filter(True_Passed_Reps >= 2)
+df3_SRB_3reps <- SRB_Scored %>%
+  filter(True_Passed_Reps >= 3)
+df4_SRB_4reps <- SRB_Scored %>%
+  filter(True_Passed_Reps == 4)
+
+# ==========================================================
+# 2. SCORE AND FILTER SCION LEAVES (SRL)
+# ==========================================================
+SRL_Scored <- SRL_Final_Table %>%
+  mutate(
+    # Paired logic: Must have reads AND pass horizontal coverage
+    Pass_Rep1 = (SRL1 >= 0.01) & (SRL1_PrimaryMapped.bam != "< 0.7"),
+    Pass_Rep2 = (SRL2 >= 0.01) & (SRL2_PrimaryMapped.bam != "< 0.7"),
+    Pass_Rep3 = (SRL3 >= 0.01) & (SRL3_PrimaryMapped.bam != "< 0.7"),
+    Pass_Rep4 = (SRL4 >= 0.01) & (SRL4_PrimaryMapped.bam != "< 0.7"),
+    
+    True_Passed_Reps = Pass_Rep1 + Pass_Rep2 + Pass_Rep3 + Pass_Rep4
+  ) %>%
+  dplyr::select(-Pass_Rep1, -Pass_Rep2, -Pass_Rep3, -Pass_Rep4) %>%
+  relocate(True_Passed_Reps, .after = gene.id)
+
+# Extract confident lists
+df1_SRL_1reps <- SRL_Scored %>%
+  filter(True_Passed_Reps >= 1)
+df2_SRL_2reps <- SRL_Scored %>%
+  filter(True_Passed_Reps >= 2)
+df3_SRL_3reps <- SRL_Scored %>%
+  filter(True_Passed_Reps >= 3)
+df4_SRL_4reps <- SRL_Scored %>%
+  filter(True_Passed_Reps == 4)
+
+# ==========================================================
+# 3. SCORE AND FILTER SCION PHLOEM/XYLEM (SRPY)
+# ==========================================================
+SRPY_Scored <- SRPY_Final_Table %>%
+  mutate(
+    # Paired logic: Must have reads AND pass horizontal coverage
+    Pass_Rep1 = (SRPY1 >= 0.01) & (SRPY1_PrimaryMapped.bam != "< 0.7"),
+    Pass_Rep2 = (SRPY2 >= 0.01) & (SRPY2_PrimaryMapped.bam != "< 0.7"),
+    Pass_Rep3 = (SRPY3 >= 0.01) & (SRPY3_PrimaryMapped.bam != "< 0.7"),
+    Pass_Rep4 = (SRPY4 >= 0.01) & (SRPY4_PrimaryMapped.bam != "< 0.7"),
+    
+    True_Passed_Reps = Pass_Rep1 + Pass_Rep2 + Pass_Rep3 + Pass_Rep4
+  ) %>%
+  dplyr::select(-Pass_Rep1, -Pass_Rep2, -Pass_Rep3, -Pass_Rep4) %>%
+  relocate(True_Passed_Reps, .after = gene.id)
+
+# Extract confident lists
+df1_SRPY_1reps <- SRPY_Scored %>%
+  filter(True_Passed_Reps >= 1)
+df2_SRPY_2reps <- SRPY_Scored %>%
+  filter(True_Passed_Reps >= 2)
+df3_SRPY_3reps <- SRPY_Scored %>%
+  filter(True_Passed_Reps >= 3)
+df4_SRPY_4reps <- SRPY_Scored %>%
+  filter(True_Passed_Reps == 4)
+```
+
+### Save the confident mobile transcripts list
+
+```{r}
+# Save each dataframe as its own CSV file
+write_csv(df3_SRB_3reps, "Confident_Mobile_RNAs_SRB3reps.csv")
+write_csv(df4_SRB_4reps, "Confident_Mobile_RNAs_SRB4reps.csv")
+write_csv(df3_SRL_3reps, "Confident_Mobile_RNAs_SRL3reps.csv")
+write_csv(df4_SRL_4reps, "Confident_Mobile_RNAs_SRL4reps.csv")
+write_csv(df3_SRPY_3reps, "Confident_Mobile_RNAs_SRPY3reps.csv")
+write_csv(df4_SRPY_4reps, "Confident_Mobile_RNAs_SRPY4reps.csv")
+
+
+
+
+write_csv(df1_SRL_1reps, "Mobile_RNAs_SRL1reps.csv")
+write_csv(df1_RSL_1reps, "Mobile_RNAs_RSL1reps.csv")
+
+```
+
+### Number of Mobile transcripts
+
+```{r}
+df1_SRPY_1reps <- SRPY_Scored %>%
+  filter(True_Passed_Reps >= 1)
+df2_SRPY_2reps <- SRPY_Scored %>%
+  filter(True_Passed_Reps >= 2)
+df3_SRPY_3reps <- SRPY_Scored %>%
+  filter(True_Passed_Reps >= 3)
+df4_SRPY_4reps <- SRPY_Scored %>%
+  filter(True_Passed_Reps == 4)
+
+df1_SRL_1reps <- SRL_Scored %>%
+  filter(True_Passed_Reps >= 1)
+df2_SRL_2reps <- SRL_Scored %>%
+  filter(True_Passed_Reps >= 2)
+df3_SRL_3reps <- SRL_Scored %>%
+  filter(True_Passed_Reps >= 3)
+df4_SRL_4reps <- SRL_Scored %>%
+  filter(True_Passed_Reps == 4)
+
+df1_SRB_1reps <- SRB_Scored %>%
+  filter(True_Passed_Reps >= 1)
+df2_SRB_2reps <- SRB_Scored %>%
+  filter(True_Passed_Reps >= 2)
+df3_SRB_3reps <- SRB_Scored %>%
+  filter(True_Passed_Reps >= 3)
+df4_SRB_4reps <- SRB_Scored %>%
+  filter(True_Passed_Reps == 4)
+
+
+# Calculate and bind all tissues directly from the Scored tables
+SRscion_Mobile_Summary_Direct <- bind_rows(
+  SRB_Scored %>% summarise(Tissue = "Scion Buds (SRB)", 
+                           `>= 1 Rep` = sum(True_Passed_Reps >= 1), `>= 2 Reps` = sum(True_Passed_Reps >= 2), 
+                           `>= 3 Reps (High Confidence)` = sum(True_Passed_Reps >= 3), `All 4 Reps (Gold Standard)` = sum(True_Passed_Reps == 4)),
+                           
+  SRL_Scored %>% summarise(Tissue = "Scion Leaves (SRL)", 
+                           `>= 1 Rep` = sum(True_Passed_Reps >= 1), `>= 2 Reps` = sum(True_Passed_Reps >= 2), 
+                           `>= 3 Reps (High Confidence)` = sum(True_Passed_Reps >= 3), `All 4 Reps (Gold Standard)` = sum(True_Passed_Reps == 4)),
+                           
+  SRPY_Scored %>% summarise(Tissue = "Scion Phloem/Xylem (SRPY)", 
+                            `>= 1 Rep` = sum(True_Passed_Reps >= 1), `>= 2 Reps` = sum(True_Passed_Reps >= 2), 
+                            `>= 3 Reps (High Confidence)` = sum(True_Passed_Reps >= 3), `All 4 Reps (Gold Standard)` = sum(True_Passed_Reps == 4))
+)
+
+print(SRscion_Mobile_Summary_Direct)
+```
+
+### Save the data
+
+```{r}
+# Save each dataframe as its own CSV file
+write_csv(SRscion_Mobile_Summary_Direct, "SR_Scion_mobile_summary.csv")
+```
+
+## Root
+
+### Load Root mobile RNA counts
+
+```{r}
+Mob_SR_root_to_shiraz_raw_counts <- read.table("Cleaned_RSscion_SRR_Mobile_Counts.txt", 
+                         header = TRUE, 
+                         sep = "\t", 
+                         check.names = FALSE, 
+                         comment.char = "#")
+# 1. Extract just the file name from the long path
+clean_namesR <- basename(colnames(Mob_SR_root_to_shiraz_raw_counts))
+
+# 2. Delete the "_PureSHZ.bam" suffix, leaving only the sample name (like "SRB1")
+clean_namesR <- gsub("_Cleaned.bam", "", clean_namesR)
+
+# 3. Apply these new, clean names back to your dataframe
+colnames(Mob_SR_root_to_shiraz_raw_counts) <- clean_namesR
+
+# separate into tissues:
+Mob_SR_root_to_SHZ_raw_counts <- Mob_SR_root_to_shiraz_raw_counts %>%
+  dplyr::select(c("Geneid","Chr","Start","End","Strand","Length","SRR1","SRR2","SRR3"))
+```
+
+### filter mobile RNA read in each repeat group
+
+```{r}
+filter_by_reps <- function(df, min_count = 0.01, min_reps = 3) {
+  df %>%
+    filter(rowSums(dplyr::select(., 7:ncol(.)) >= min_count) >= min_reps)
+}
+
+# ---------------------------------------------------------
+# EXAMPLE 2: Keep genes with >= 1 count in ANY 3 reps
+# ---------------------------------------------------------
+Mob_SR_root_3reps  <- filter_by_reps(Mob_SR_root_to_SHZ_raw_counts,  min_count = 0.01, min_reps = 3) %>%
+  rename(gene.id = Geneid)
+
+# ---------------------------------------------------------
+# EXAMPLE 2: Keep genes with >= 1 count in ANY 2 reps
+# ---------------------------------------------------------
+Mob_SR_root_2reps  <- filter_by_reps(Mob_SR_root_to_SHZ_raw_counts,  min_count = 0.01, min_reps = 2) %>%
+  rename(gene.id = Geneid)
+
+# ---------------------------------------------------------
+# EXAMPLE 3: Keep genes with >= 1 count in ANY 1 rep 
+# ---------------------------------------------------------
+Mob_SR_root_1reps  <- filter_by_reps(Mob_SR_root_to_SHZ_raw_counts,  min_count = 0.01, min_reps = 1) %>%
+  rename(gene.id = Geneid)
+```
+
+### Put all mobile transcript together
+
+```{r}
+# Create a summary dataframe counting the rows (genes) in each filtered dataset
+SR_Root_Mobile_Summary <- data.frame(
+  Tissue = "Root",
+  At_Least_1_Rep = nrow(Mob_SR_root_1reps),
+  At_Least_2_Reps = nrow(Mob_SR_root_2reps),
+  All_3_Reps = nrow(Mob_SR_root_3reps)
+)
+```
+
+### Export the entire list to one Excel workbook
+
+```{r}
+write.csv(SR_Root_Mobile_Summary, "SRR_mobile_RNA_Filter_Summary.csv", row.names = FALSE)
+```
+
+### extract mobile transcripts exon infor
+
+```{r}
+SHZ_gene.info.from.gff <- read_lines("F:/PhD_Research/2nd_Chapter_Mobile_RNA/Reference_genomes/Annotations/Final_annotations/SHZ_1654_combined_annotation.gff3") %>%
+  tibble(raw_text = .) %>%
+  filter(!grepl("^#", raw_text)) %>%
+  separate(raw_text, 
+           into = c("X1", "X2", "X3", "X4", "X5", "X6", "X7", "X8", "X9"), 
+           sep = "\\s+",      # Regex for "any whitespace"
+           extra = "merge",   # Stops splitting after the 9th column!
+           fill = "right") %>%
+  # Now your original select will work perfectly
+  dplyr::select(X1, X4, X5, X9, X7, X3) %>%
+  set_colnames(c("gene.chr", "gene.start", "gene.end", "gene.id", "gene.strand", "gene.biotype")) %>%
+  mutate(across(2:3, as.numeric)) %>%
+  arrange(gene.chr, gene.start) %>%
+  na.omit()
+
+SHZ_exon_gff <- SHZ_gene.info.from.gff %>%
+  filter(gene.biotype == "exon") %>%
+  mutate(
+    gene.id = str_extract(gene.id, "(?<=Parent=)[^;]+"),
+    gene.id = str_remove(gene.id, "-T\\d+$")
+  ) %>%
+  arrange(gene.chr, gene.end)
+
+SRR_mobile_exon_gff <- SHZ_exon_gff %>% filter(gene.id %in% Mob_SR_root_1reps$gene.id)  
+```
+
+### Define function for transcript coverage
+
+```{r}
+# Define the function
+calculate_mobile_coverage <- function(tissue_exon_gff, bam_directory, threshold = 0.70) {
+  
+  message("\n--- Starting analysis for directory: ", bam_directory, " ---")
+  
+  # 1. CLEAN THE EXONS & BUILD THE GRANGES OBJECT
+  mobile_exon_clean <- tissue_exon_gff %>%
+    distinct(gene.chr, gene.start, gene.end, gene.strand, gene.id, .keep_all = TRUE)
+  
+  GRange_exons <- makeGRangesFromDataFrame(
+    mobile_exon_clean,
+    keep.extra.columns = TRUE,
+    seqnames.field = "gene.chr",
+    start.field = "gene.start",
+    end.field = "gene.end",
+    strand.field = "gene.strand",
+    starts.in.df.are.0based = FALSE
+  )
+  
+  # 2. APPLY THE BAM HEADER FIX
+  bamfiles <- list.files(bam_directory, pattern=".bam$", full.names = TRUE)
+  if(length(bamfiles) == 0) stop("No BAM files found in this directory!")
+  
+  bam_header <- scanBamHeader(bamfiles[1])
+  true_bam_lengths <- bam_header[[1]]$targets
+  
+  common_chrs <- intersect(seqlevels(GRange_exons), names(true_bam_lengths))
+  seqlevels(GRange_exons, pruning.mode="coarse") <- common_chrs
+  seqlengths(GRange_exons) <- true_bam_lengths[common_chrs]
+  
+  # 3. LOOP THROUGH REPLICATES TO CALCULATE COVERAGE
+  coverage_results_list <- lapply(bamfiles, function(bamfile) {
+    sample_name <- basename(bamfile)
+    message("  -> Processing: ", sample_name)
+    
+    bam.input <- readGAlignments(bamfile, param = ScanBamParam(which = GRange_exons))
+    bam_coverage <- coverage(bam.input)
+    exon_specific_coverage <- bam_coverage[GRange_exons]
+    
+    exon_results <- as.data.frame(GRange_exons) %>%
+      mutate(
+        covered_bases = sum(exon_specific_coverage > 0),
+        exon_length = width
+      )
+    
+    transcript_coverage <- exon_results %>%
+      group_by(gene.id) %>%
+      summarise(
+        total_covered_bases = sum(covered_bases),
+        total_transcript_length = sum(exon_length),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        percent_coverage = total_covered_bases / total_transcript_length,
+        sample_id = sample_name
+      )
+    
+    rm(bam.input, bam_coverage, exon_specific_coverage)
+    gc()
+    
+    return(transcript_coverage)
+  })
+  
+  # 4. COMBINE AND FILTER THE FINAL RESULTS
+  all_coverage <- bind_rows(coverage_results_list)
+  
+  confident_mobile_genes <- all_coverage %>%
+    filter(percent_coverage >= threshold)
+  
+  message("--- Finished! Found ", nrow(confident_mobile_genes), " confident events. ---\n")
+  return(confident_mobile_genes)
+}
+```
+
+### Calculate transcript coverage by GenomicRange
+
+```{r}
+# 1. Run Scion Leaves (SRL)
+Mobile_RNAs_coverage_length_SRR <- calculate_mobile_coverage(
+  tissue_exon_gff = SRR_mobile_exon_gff, 
+  bam_directory = "E:/RNAseq_SR/Default_Mapping_FilterOut_Primary_inBoth/All_P_alignments/SRR/"
+)
+```
+
+```{r}
+# Save each dataframe as its own CSV file
+write_csv(Mobile_RNAs_coverage_length_SRR, "Mobile_RNAs_coverage_length_SRR.csv")
+```
+
+### Filter coverage > 70% 
+
+```{r}
+# ==========================================================
+#  PROCESS ROOT
+# ==========================================================
+
+# Step A: Pivot the coverage data from long to wide
+SRR_coverage_wide <- Mobile_RNAs_coverage_length_SRR %>%
+  dplyr::select(gene.id, sample_id, percent_coverage) %>%
+  pivot_wider(names_from = sample_id, values_from = percent_coverage)
+
+# Step B: Merge with counts and format the text
+SRR_Final_Table <- Mob_SR_root_1reps %>%
+  left_join(SRR_coverage_wide, by = "gene.id") %>%
+  mutate(across(ends_with(".bam"), 
+                ~ ifelse(is.na(.), "< 0.7", as.character(round(., 7))))) %>%
+  dplyr::select(gene.id, SRR1, SRR2, SRR3, SRR1_PrimaryMapped.bam, SRR2_PrimaryMapped.bam, SRR3_PrimaryMapped.bam)
+```
+
+### Mobile RNA as 1. clean.bam > 0.01. 2. Length >70%
+
+```{r}
+# 1. Score the replicates by forcing BOTH conditions to be true
+# ==========================================================
+# 2. SCORE AND FILTER SCION LEAVES (SRB)
+# ==========================================================
+SRR_Scored <- SRR_Final_Table %>%
+  mutate(
+    # Rep 1 must have > 0.01 counts (all best score multi-mapped reads to ruggeri, featureCounts -M allow splite Rug specific read count splite) AND not have failed coverage 
+    Pass_Rep1 = (SRR1 >= 0.01) & (SRR1_PrimaryMapped.bam != "< 0.7"),
+    
+    # Rep 2 must have > 0.01 counts AND not have failed coverage
+    Pass_Rep2 = (SRR2 >= 0.01) & (SRR2_PrimaryMapped.bam != "< 0.7"),
+    
+    # Rep 3 must have > 0.01 counts AND not have failed coverage
+    Pass_Rep3 = (SRR3 >= 0.01) & (SRR3_PrimaryMapped.bam != "< 0.7"),
+    
+    # Add the TRUE/FALSE values together (TRUE = 1, FALSE = 0)
+    True_Passed_Reps = Pass_Rep1 + Pass_Rep2 + Pass_Rep3) %>%
+  # Drop the temporary Pass columns to keep the table clean
+  dplyr::select(-Pass_Rep1, -Pass_Rep2, -Pass_Rep3) %>%
+  # Move the final score to the front
+  relocate(True_Passed_Reps, .after = gene.id)
+
+# Extract confident lists
+df1_SRR_1reps <- SRR_Scored %>%
+  filter(True_Passed_Reps >= 1)
+df2_SRR_2reps <- SRR_Scored %>%
+  filter(True_Passed_Reps >= 2)
+df3_SRR_3reps <- SRR_Scored %>%
+  filter(True_Passed_Reps == 3)
+
+length(unique(df1_SRR_1reps$gene.id))
+length(unique(df2_SRR_2reps$gene.id))
+length(unique(df3_SRR_3reps$gene.id))
+SR_Root_mobile_summary <- tibble(
+  Tissue = "Rootstock Roots (SRR)",
+  `1reps` = length(unique(df1_SRR_1reps$gene.id)),
+  `High Confidence (>= 2 Reps)` = length(unique(df2_SRR_2reps$gene.id)),
+  `Gold Standard (All 3 Reps)` = length(unique(df3_SRR_3reps$gene.id))
+)
+```
+
+### Save the confident mobile transcripts list
+
+```{r}
+# Save each dataframe as its own CSV file
+write_csv(df1_SRR_1reps, "Confident_Mobile_RNAs_SRR1reps.csv")
+write_csv(df2_SRR_2reps, "Confident_Mobile_RNAs_SRR2reps.csv")
+write_csv(df3_SRR_3reps, "Confident_Mobile_RNAs_SRR3reps.csv")
+write_csv(SR_Root_mobile_summary, "SR_Root_mobile_summary.csv")
+
+
+write_csv(df1_SRR_1reps, "Confident_Mobile_RNAs_SRR1reps.csv")
+write_csv(df1_SRL_1reps, "Confident_Mobile_RNAs_SRL1reps.csv")
+write_csv(df1_SRB_1reps, "Confident_Mobile_RNAs_SRB1reps.csv")
+write_csv(df1_SRPY_1reps, "Confident_Mobile_RNAs_SRPY1reps.csv")
+
+write_csv(df1_RSR_1reps, "Confident_Mobile_RNAs_RSR1reps.csv")
+write_csv(df1_RSL_1reps, "Confident_Mobile_RNAs_RSL1reps.csv")
+write_csv(df1_RSB_1reps, "Confident_Mobile_RNAs_RSB1reps.csv")
+write_csv(df1_RSPY_1reps, "Confident_Mobile_RNAs_RSPY1reps.csv")
+
+
+
+```
+
+# Ruggeri-Shiraz samples
+
+## Scion
+
+### Load RS scion mobile RNA
+
+```{r}
+Mob_RSscion_SRR_raw_counts <- read.table("Cleaned_RSscion_SRR_Mobile_Counts.txt",
+                         header = TRUE, 
+                         sep = "\t", 
+                         check.names = FALSE, 
+                         comment.char = "#") %>%
+  dplyr::rename(gene.id = Geneid)
+  
+# 1. Extract just the file name from the long path
+clean_namesR <- basename(colnames(Mob_RSscion_SRR_raw_counts))
+
+# 2. Delete the "_Cleaned.bam" suffix, leaving only the sample name (like "SRB1")
+clean_namesR <- gsub("_Cleaned.bam", "", clean_namesR)
+
+# 3. Apply these new, clean names back to your dataframe
+colnames(Mob_RSscion_SRR_raw_counts) <- clean_namesR
+
+# separate into tissues:
+Mob_RSB_raw_counts <- Mob_RSscion_SRR_raw_counts %>%
+  dplyr::select(c("gene.id","Chr","Start","End","Strand","Length","RSB1","RSB2","RSB3","RSB4"))
+Mob_RSL_raw_counts <- Mob_RSscion_SRR_raw_counts %>%
+  dplyr::select(c("gene.id","Chr","Start","End","Strand","Length","RSL1","RSL2","RSL3","RSL4"))
+Mob_RSPY_raw_counts <- Mob_RSscion_SRR_raw_counts %>%
+  dplyr::select(c("gene.id","Chr","Start","End","Strand","Length","RSPY1","RSPY2","RSPY3","RSPY4"))
+```
+
+### filter mobile RNA read in each repeat group
+
+```{r}
+filter_by_reps <- function(df, min_count = 0.01, min_reps = 4) {
+  df %>%
+    filter(rowSums(dplyr::select(., 7:ncol(.)) >= min_count) >= min_reps)
+}
+
+# ---------------------------------------------------------
+# EXAMPLE 1: Keep genes with >= 1 count in ALL 4 reps
+# ---------------------------------------------------------
+Mob_RS_bud_4reps <- filter_by_reps(Mob_RSB_raw_counts,  min_count = 0.01, min_reps = 4)
+Mob_RS_leaf_4reps <- filter_by_reps(Mob_RSL_raw_counts, min_count = 0.01, min_reps = 4)
+Mob_RS_PY_4reps   <- filter_by_reps(Mob_RSPY_raw_counts,   min_count = 0.01, min_reps = 4)
+
+# ---------------------------------------------------------
+# EXAMPLE 2: Keep genes with >= 1 count in ANY 3 reps
+# ---------------------------------------------------------
+Mob_RS_bud_3reps <- filter_by_reps(Mob_RSB_raw_counts,  min_count = 0.01, min_reps = 3)
+Mob_RS_leaf_3reps <- filter_by_reps(Mob_RSL_raw_counts, min_count = 0.01, min_reps = 3)
+Mob_RS_PY_3reps   <- filter_by_reps(Mob_RSPY_raw_counts,   min_count = 0.01, min_reps = 3)
+
+# ---------------------------------------------------------
+# EXAMPLE 2: Keep genes with >= 1 count in ANY 2 reps
+# ---------------------------------------------------------
+Mob_RS_bud_2reps <- filter_by_reps(Mob_RSB_raw_counts,  min_count = 0.01, min_reps = 2)
+Mob_RS_leaf_2reps <- filter_by_reps(Mob_RSL_raw_counts, min_count = 0.01, min_reps = 2)
+Mob_RS_PY_2reps   <- filter_by_reps(Mob_RSPY_raw_counts,   min_count = 0.01, min_reps = 2)
+
+# ---------------------------------------------------------
+# EXAMPLE 3: Keep genes with >= 1 count in ANY 1 rep 
+# ---------------------------------------------------------
+Mob_RS_bud_1reps <- filter_by_reps(Mob_RSB_raw_counts,  min_count = 0.01, min_reps = 1)
+Mob_RS_leaf_1reps <- filter_by_reps(Mob_RSL_raw_counts, min_count = 0.01, min_reps = 1)
+Mob_RS_PY_1reps   <- filter_by_reps(Mob_RSPY_raw_counts,   min_count = 0.01, min_reps = 1)
+```
+
+### Put all mobile transcript together
+
+```{r}
+RSS_filtered_dfs <- list(
+  "Bud_4_reps"  = Mob_RS_bud_4reps,
+  "Leaf_4_reps" = Mob_RS_leaf_4reps,
+  "PY_4_reps"   = Mob_RS_PY_4reps,
+  
+  "Bud_3_reps"  = Mob_RS_bud_3reps,
+  "Leaf_3_reps" = Mob_RS_leaf_3reps,
+  "PY_3_reps"   = Mob_RS_PY_3reps,
+  
+  "Bud_2_reps"  = Mob_RS_bud_2reps,
+  "Leaf_2_reps" = Mob_RS_leaf_2reps,
+  "PY_2_reps"   = Mob_RS_PY_2reps,
+  
+  "Bud_1_rep"   = Mob_RS_bud_1reps,
+  "Leaf_1_rep"  = Mob_RS_leaf_1reps,
+  "PY_1_rep"    = Mob_RS_PY_1reps
+)
+```
+
+### Export the entire list to one Excel workbook
+
+```{R}
+write_xlsx(RSS_filtered_dfs, path = "RSS_Mobility_Filtering_Results.xlsx")
+```
+
+### extract mobile transcripts exon infor
+
+```{r}
+RSB_mobile_exon_gff <- SHZ_exon_gff %>% filter(gene.id %in% Mob_RS_bud_1reps$gene.id)  
+
+RSL_mobile_exon_gff <- SHZ_exon_gff  %>% filter(gene.id %in% Mob_RS_leaf_1reps$gene.id)  
+
+RSPY_mobile_exon_gff <- SHZ_exon_gff  %>% filter(gene.id %in% Mob_RS_PY_1reps$gene.id)   
+```
+
+### Define function for transcript coverage
+
+```{r}
+# Define the function
+calculate_mobile_coverage <- function(tissue_exon_gff, bam_directory, threshold = 0.7) {
+  
+  message("\n--- Starting analysis for directory: ", bam_directory, " ---")
+  
+  # 1. CLEAN THE EXONS & BUILD THE GRANGES OBJECT
+  mobile_exon_clean <- tissue_exon_gff %>%
+    distinct(gene.chr, gene.start, gene.end, gene.strand, gene.id, .keep_all = TRUE)
+  
+  GRange_exons <- makeGRangesFromDataFrame(
+    mobile_exon_clean,
+    keep.extra.columns = TRUE,
+    seqnames.field = "gene.chr",
+    start.field = "gene.start",
+    end.field = "gene.end",
+    strand.field = "gene.strand",
+    starts.in.df.are.0based = FALSE
+  )
+  
+  # 2. APPLY THE BAM HEADER FIX
+  bamfiles <- list.files(bam_directory, pattern=".bam$", full.names = TRUE)
+  if(length(bamfiles) == 0) stop("No BAM files found in this directory!")
+  
+  bam_header <- scanBamHeader(bamfiles[1])
+  true_bam_lengths <- bam_header[[1]]$targets
+  
+  common_chrs <- intersect(seqlevels(GRange_exons), names(true_bam_lengths))
+  seqlevels(GRange_exons, pruning.mode="coarse") <- common_chrs
+  seqlengths(GRange_exons) <- true_bam_lengths[common_chrs]
+  
+  # 3. LOOP THROUGH REPLICATES TO CALCULATE COVERAGE
+  coverage_results_list <- lapply(bamfiles, function(bamfile) {
+    sample_name <- basename(bamfile)
+    message("  -> Processing: ", sample_name)
+    
+    bam.input <- readGAlignments(bamfile, param = ScanBamParam(which = GRange_exons))
+    bam_coverage <- coverage(bam.input)
+    exon_specific_coverage <- bam_coverage[GRange_exons]
+    
+    exon_results <- as.data.frame(GRange_exons) %>%
+      mutate(
+        covered_bases = sum(exon_specific_coverage > 0),
+        exon_length = width
+      )
+    
+    transcript_coverage <- exon_results %>%
+      group_by(gene.id) %>%
+      summarise(
+        total_covered_bases = sum(covered_bases),
+        total_transcript_length = sum(exon_length),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        percent_coverage = total_covered_bases / total_transcript_length,
+        sample_id = sample_name
+      )
+    
+    rm(bam.input, bam_coverage, exon_specific_coverage)
+    gc()
+    
+    return(transcript_coverage)
+  })
+  
+  # 4. COMBINE AND FILTER THE FINAL RESULTS
+  all_coverage <- bind_rows(coverage_results_list)
+  
+  confident_mobile_genes <- all_coverage %>%
+    filter(percent_coverage >= threshold)
+  
+  message("--- Finished! Found ", nrow(confident_mobile_genes), " confident events. ---\n")
+  return(confident_mobile_genes)
+}
+```
+
+### Calculate transcript coverage by GenomicRange
+
+```{r}
+# 1. Run Scion Leaves (RSL)
+Mobile_RNAs_coverage_length_RSL <- calculate_mobile_coverage(
+  tissue_exon_gff = RSL_mobile_exon_gff, 
+  bam_directory = "E:/RNAseq_SR/Default_Mapping_FilterOut_Primary_inBoth/All_P_alignments/RSL/"
+)
+
+# 2. Run Scion Buds (RSB)
+Mobile_RNAs_coverage_length_RSB <- calculate_mobile_coverage(
+  tissue_exon_gff = RSB_mobile_exon_gff, 
+  bam_directory = "E:/RNAseq_SR/Default_Mapping_FilterOut_Primary_inBoth/All_P_alignments/RSB/"
+)
+
+# 3. Run Scion Phloem/Xylem (RSPY)
+Mobile_RNAs_coverage_length_RSPY <- calculate_mobile_coverage(
+  tissue_exon_gff = RSPY_mobile_exon_gff, 
+  bam_directory = "E:/RNAseq_SR/Default_Mapping_FilterOut_Primary_inBoth/All_P_alignments/RSPY/"
+)
+```
+
+
+```{r}
+# Save each dataframe as its own CSV file
+write_csv(Mobile_RNAs_coverage_length_RSL, "Mobile_RNAs_coverage_length_RSL.csv")
+write_csv(Mobile_RNAs_coverage_length_RSB, "Mobile_RNAs_coverage_length_RSB.csv")
+write_csv(Mobile_RNAs_coverage_length_RSPY, "Mobile_RNAs_coverage_length_RSPY.csv")
+```
+
+### Filter coverage > 70% 
+
+```{r}
+# ==========================================================
+# 1. PROCESS SCION BUDS (RSB)
+# ==========================================================
+
+# Step A: Pivot the coverage data from long to wide
+RSB_coverage_wide <- Mobile_RNAs_coverage_length_RSB %>%
+  dplyr::select(gene.id, sample_id, percent_coverage) %>%
+  pivot_wider(names_from = sample_id, values_from = percent_coverage)
+
+# Step B: Merge with counts and format the text
+RSB_Final_Table <- Mob_RS_bud_1reps %>%
+  left_join(RSB_coverage_wide, by = "gene.id") %>%
+  # Target only the BAM columns, replace NA with "< 0.7", and leave actual numbers alone
+  mutate(across(ends_with(".bam"), 
+                ~ ifelse(is.na(.), "< 0.7", as.character(round(., 7))))) %>%
+  dplyr::select(gene.id, RSB1, RSB2, RSB3, RSB4, RSB1_PrimaryMapped.bam, RSB2_PrimaryMapped.bam, RSB3_PrimaryMapped.bam, RSB4_PrimaryMapped.bam)
+
+
+# ==========================================================
+# 2. PROCESS SCION LEAVES (RSL)
+# ==========================================================
+
+RSL_coverage_wide <- Mobile_RNAs_coverage_length_RSL %>%
+  dplyr::select(gene.id, sample_id, percent_coverage) %>%
+  pivot_wider(names_from = sample_id, values_from = percent_coverage)
+
+RSL_Final_Table <- Mob_RS_leaf_1reps %>%
+  left_join(RSL_coverage_wide, by = "gene.id") %>%
+  mutate(across(ends_with(".bam"), 
+                ~ ifelse(is.na(.), "< 0.7", as.character(round(., 7))))) %>%
+  dplyr::select(gene.id, RSL1, RSL2, RSL3, RSL4, RSL1_PrimaryMapped.bam, RSL2_PrimaryMapped.bam, RSL3_PrimaryMapped.bam, RSL4_PrimaryMapped.bam)
+
+
+# ==========================================================
+# 3. PROCESS SCION PHLOEM/XYLEM (RSPY)
+# ==========================================================
+
+RSPY_coverage_wide <- Mobile_RNAs_coverage_length_RSPY %>%
+  dplyr::select(gene.id, sample_id, percent_coverage) %>%
+  pivot_wider(names_from = sample_id, values_from = percent_coverage)
+
+RSPY_Final_Table <- Mob_RS_PY_1reps %>%
+  left_join(RSPY_coverage_wide, by = "gene.id") %>%
+  mutate(across(ends_with(".bam"), 
+                ~ ifelse(is.na(.), "< 0.7", as.character(round(., 7))))) %>%
+  dplyr::select(gene.id, RSPY1, RSPY2, RSPY3, RSPY4, RSPY1_PrimaryMapped.bam, RSPY2_PrimaryMapped.bam, RSPY3_PrimaryMapped.bam, RSPY4_PrimaryMapped.bam)
+```
+
+### Mobile RNA as 1. clean > 0.01. 2. Length >70%
+
+```{r}
+# 1. Score the replicates by forcing BOTH conditions to be true
+# ==========================================================
+# 2. SCORE AND FILTER SCION LEAVES (RSB)
+# ==========================================================
+RSB_Scored <- RSB_Final_Table %>%
+  mutate(
+    Pass_Rep1 = (RSB1 >= 0.01) & (RSB1_PrimaryMapped.bam != "< 0.7"),
+    
+    # Rep 2 must have > 0.01 counts AND not have failed coverage
+    Pass_Rep2 = (RSB2 >= 0.01) & (RSB2_PrimaryMapped.bam != "< 0.7"),
+    
+    # Rep 3 must have > 0.01 counts AND not have failed coverage
+    Pass_Rep3 = (RSB3 >= 0.01) & (RSB3_PrimaryMapped.bam != "< 0.7"),
+    
+    # Rep 4 must have > 0.01 counts AND not have failed coverage
+    Pass_Rep4 = (RSB4 >= 0.01) & (RSB4_PrimaryMapped.bam != "< 0.7"),
+    
+    # Add the TRUE/FALSE values together (TRUE = 1, FALSE = 0)
+    True_Passed_Reps = Pass_Rep1 + Pass_Rep2 + Pass_Rep3 + Pass_Rep4
+  ) %>%
+  # Drop the temporary Pass columns to keep the table clean
+  dplyr::select(-Pass_Rep1, -Pass_Rep2, -Pass_Rep3, -Pass_Rep4) %>%
+  # Move the final score to the front
+  relocate(True_Passed_Reps, .after = gene.id)
+
+# Extract confident lists
+df1_RSB_1reps <- RSB_Scored %>%
+  filter(True_Passed_Reps >= 1)
+df2_RSB_2reps <- RSB_Scored %>%
+  filter(True_Passed_Reps >= 2)
+df3_RSB_3reps <- RSB_Scored %>%
+  filter(True_Passed_Reps >= 3)
+df4_RSB_4reps <- RSB_Scored %>%
+  filter(True_Passed_Reps == 4)
+
+# ==========================================================
+# 2. SCORE AND FILTER SCION LEAVES (RSL)
+# ==========================================================
+RSL_Scored <- RSL_Final_Table %>%
+  mutate(
+    # Paired logic: Must have reads AND pass horizontal coverage
+    Pass_Rep1 = (RSL1 >= 0.01) & (RSL1_PrimaryMapped.bam != "< 0.7"),
+    Pass_Rep2 = (RSL2 >= 0.01) & (RSL2_PrimaryMapped.bam != "< 0.7"),
+    Pass_Rep3 = (RSL3 >= 0.01) & (RSL3_PrimaryMapped.bam != "< 0.7"),
+    Pass_Rep4 = (RSL4 >= 0.01) & (RSL4_PrimaryMapped.bam != "< 0.7"),
+    
+    True_Passed_Reps = Pass_Rep1 + Pass_Rep2 + Pass_Rep3 + Pass_Rep4
+  ) %>%
+  dplyr::select(-Pass_Rep1, -Pass_Rep2, -Pass_Rep3, -Pass_Rep4) %>%
+  relocate(True_Passed_Reps, .after = gene.id)
+
+# Extract confident lists
+df1_RSL_1reps <- RSL_Scored %>% filter(True_Passed_Reps >= 1)
+df2_RSL_2reps <- RSL_Scored %>% filter(True_Passed_Reps >= 2)
+df3_RSL_3reps <- RSL_Scored %>% filter(True_Passed_Reps >= 3)
+df4_RSL_4reps <- RSL_Scored %>% filter(True_Passed_Reps == 4)
+
+
+# ==========================================================
+# 3. SCORE AND FILTER SCION PHLOEM/XYLEM (RSPY)
+# ==========================================================
+RSPY_Scored <- RSPY_Final_Table %>%
+  mutate(
+    # Paired logic: Must have reads AND pass horizontal coverage
+    Pass_Rep1 = (RSPY1 >= 0.01) & (RSPY1_PrimaryMapped.bam != "< 0.7"),
+    Pass_Rep2 = (RSPY2 >= 0.01) & (RSPY2_PrimaryMapped.bam != "< 0.7"),
+    Pass_Rep3 = (RSPY3 >= 0.01) & (RSPY3_PrimaryMapped.bam != "< 0.7"),
+    Pass_Rep4 = (RSPY4 >= 0.01) & (RSPY4_PrimaryMapped.bam != "< 0.7"),
+    
+    True_Passed_Reps = Pass_Rep1 + Pass_Rep2 + Pass_Rep3 + Pass_Rep4
+  ) %>%
+  dplyr::select(-Pass_Rep1, -Pass_Rep2, -Pass_Rep3, -Pass_Rep4) %>%
+  relocate(True_Passed_Reps, .after = gene.id)
+
+# Extract confident lists
+df1_RSPY_1reps <- RSPY_Scored %>% filter(True_Passed_Reps >= 1)
+df2_RSPY_2reps <- RSPY_Scored %>% filter(True_Passed_Reps >= 2)
+df3_RSPY_3reps <- RSPY_Scored %>% filter(True_Passed_Reps >= 3)
+df4_RSPY_4reps <- RSPY_Scored %>% filter(True_Passed_Reps == 4)
+```
+
+### Save the confident mobile transcripts list
+
+```{r}
+# Save each dataframe as its own CSV file
+write_csv(df1_RSB_1reps, "Confident_Mobile_RNAs_RSB1reps.csv")
+write_csv(df2_RSB_2reps, "Confident_Mobile_RNAs_RSB2reps.csv")
+write_csv(df3_RSB_3reps, "Confident_Mobile_RNAs_RSB3reps.csv")
+write_csv(df4_RSB_4reps, "Confident_Mobile_RNAs_RSB4reps.csv")
+
+write_csv(df1_RSL_1reps, "Confident_Mobile_RNAs_RSL1reps.csv")
+write_csv(df2_RSL_2reps, "Confident_Mobile_RNAs_RSL2reps.csv")
+write_csv(df3_RSL_3reps, "Confident_Mobile_RNAs_RSL3reps.csv")
+write_csv(df4_RSL_4reps, "Confident_Mobile_RNAs_RSL4reps.csv")
+
+write_csv(df1_RSPY_1reps, "Confident_Mobile_RNAs_RSPY1reps.csv")
+write_csv(df2_RSPY_2reps, "Confident_Mobile_RNAs_RSPY2reps.csv")
+write_csv(df3_RSPY_3reps, "Confident_Mobile_RNAs_RSPY3reps.csv")
+write_csv(df4_RSPY_4reps, "Confident_Mobile_RNAs_RSPY4reps.csv")
+
+```
+
+### Number of Mobile transcripts
+
+```{r}
+# Calculate and bind all tissues directly from the Scored tables
+RSscion_Mobile_Summary_Direct <- bind_rows(
+  RSB_Scored %>% summarise(Tissue = "Scion Buds (RSB)", 
+                           `>= 1 Rep` = sum(True_Passed_Reps >= 1), `>= 2 Reps` = sum(True_Passed_Reps >= 2), 
+                           `>= 3 Reps (High Confidence)` = sum(True_Passed_Reps >= 3), `All 4 Reps (Gold Standard)` = sum(True_Passed_Reps == 4)),
+                           
+  RSL_Scored %>% summarise(Tissue = "Scion Leaves (RSL)", 
+                           `>= 1 Rep` = sum(True_Passed_Reps >= 1), `>= 2 Reps` = sum(True_Passed_Reps >= 2), 
+                           `>= 3 Reps (High Confidence)` = sum(True_Passed_Reps >= 3), `All 4 Reps (Gold Standard)` = sum(True_Passed_Reps == 4)),
+                           
+  RSPY_Scored %>% summarise(Tissue = "Scion Phloem/Xylem (RSPY)", 
+                            `>= 1 Rep` = sum(True_Passed_Reps >= 1), `>= 2 Reps` = sum(True_Passed_Reps >= 2), 
+                            `>= 3 Reps (High Confidence)` = sum(True_Passed_Reps >= 3), `All 4 Reps (Gold Standard)` = sum(True_Passed_Reps == 4))
+)
+
+print(RSscion_Mobile_Summary_Direct)
+
+# 1. Combine all tissue lists into one large vector, then extract only the unique IDs
+all_RS_scion_genes <- unique(unlist(RS_scion_genes_3reps))
+
+# 2. Count the total number of unique genes
+total_unique_RSscion_genes <- length(all_RS_scion_genes)
+
+# 3. Print the summary number
+print(paste("Total unique mobile genes in Shiraz scion (Buds, Leaves, or Phloem):", total_unique_scion_genes))
+```
+
+### Save the data
+
+```{r}
+# Save each dataframe as its own CSV file
+write_csv(RSscion_Mobile_Summary_Direct, "RS_Scion_mobile_summary.csv")
+```
+
+## Root
+
+### Load Root mobile RNA counts
+
+```{r}
+Mob_RS_root_to_shiraz_raw_counts <- read.table("Cleaned_SRS_RSR_Mobile_Counts.txt", 
+                         header = TRUE, 
+                         sep = "\t", 
+                         check.names = FALSE, 
+                         comment.char = "#")
+# 1. Extract just the file name from the long path
+clean_namesR <- basename(colnames(Mob_RS_root_to_shiraz_raw_counts))
+
+# 2. Delete the "_PureSHZ.bam" suffix, leaving only the sample name (like "RSB1")
+clean_namesR <- gsub("_Cleaned.bam", "", clean_namesR)
+
+# 3. Apply these new, clean names back to your dataframe
+colnames(Mob_RS_root_to_shiraz_raw_counts) <- clean_namesR
+
+# separate into tissues:
+Mob_RS_root_to_SHZ_raw_counts <- Mob_RS_root_to_shiraz_raw_counts %>%
+  dplyr::select(c("Geneid","Chr","Start","End","Strand","Length","RSR12","RSR21","RSR3","RSR4"))
+```
+
+### filter mobile RNA read in each repeat group
+
+```{r}
+filter_by_reps <- function(df, min_count = 0.01, min_reps = 4) {
+  df %>%
+    filter(rowSums(dplyr::select(., 7:ncol(.)) >= min_count) >= min_reps)
+}
+
+# ---------------------------------------------------------
+# EXAMPLE 1: Keep genes with >= 1 count in ANY 4 reps
+# ---------------------------------------------------------
+Mob_RS_root_4rep  <- filter_by_reps(Mob_RS_root_to_SHZ_raw_counts,  min_count = 0.01, min_reps = 4) %>%
+  rename(gene.id = Geneid)
+
+# ---------------------------------------------------------
+# EXAMPLE 2: Keep genes with >= 1 count in ANY 3 reps
+# ---------------------------------------------------------
+Mob_RS_root_3rep  <- filter_by_reps(Mob_RS_root_to_SHZ_raw_counts,  min_count = 0.01, min_reps = 3) %>%
+  rename(gene.id = Geneid)
+
+# ---------------------------------------------------------
+# EXAMPLE 3: Keep genes with >= 1 count in ANY 2 reps
+# ---------------------------------------------------------
+Mob_RS_root_2rep  <- filter_by_reps(Mob_RS_root_to_SHZ_raw_counts,  min_count = 0.01, min_reps = 2) %>%
+  rename(gene.id = Geneid)
+
+# ---------------------------------------------------------
+# EXAMPLE 4: Keep genes with >= 1 count in ANY 1 rep 
+# ---------------------------------------------------------
+Mob_RS_root_1rep  <- filter_by_reps(Mob_RS_root_to_SHZ_raw_counts,  min_count = 0.01, min_reps = 1) %>%
+  rename(gene.id = Geneid)
+```
+
+### Put all mobile transcript together
+
+```{r}
+# Create a summary dataframe counting the rows (genes) in each filtered dataset
+RS_Root_Mobile_Summary <- data.frame(
+  Tissue = "Root",
+  At_Least_1_Rep = nrow(Mob_RS_root_1rep),
+  At_Least_2_Reps = nrow(Mob_RS_root_2rep),
+  At_Least_3_Reps = nrow(Mob_RS_root_3rep),
+  At_Least_4_Reps = nrow(Mob_RS_root_4rep)
+)
+```
+
+### Export the entire list to one Excel workbook
+
+```{r}
+write.csv(RS_Root_Mobile_Summary, "RSR_mobile_RNA_Filter_Summary.csv", row.names = FALSE)
+```
+
+### extract mobile transcripts exon infor
+
+```{r}
+RSR_mobile_exon_gff <- Rug_exon_gff %>% filter(gene.id %in% Mob_RS_root_1rep$gene.id)  
+```
+
+### Define function for transcript coverage
+
+```{r}
+# Define the function
+calculate_mobile_coverage <- function(tissue_exon_gff, bam_directory, threshold = 0.70) {
+  
+  message("\n--- Starting analysis for directory: ", bam_directory, " ---")
+  
+  # 1. CLEAN THE EXONS & BUILD THE GRANGES OBJECT
+  mobile_exon_clean <- tissue_exon_gff %>%
+    distinct(gene.chr, gene.start, gene.end, gene.strand, gene.id, .keep_all = TRUE)
+  
+  GRange_exons <- makeGRangesFromDataFrame(
+    mobile_exon_clean,
+    keep.extra.columns = TRUE,
+    seqnames.field = "gene.chr",
+    start.field = "gene.start",
+    end.field = "gene.end",
+    strand.field = "gene.strand",
+    starts.in.df.are.0based = FALSE
+  )
+  
+  # 2. APPLY THE BAM HEADER FIX
+  bamfiles <- list.files(bam_directory, pattern=".bam$", full.names = TRUE)
+  if(length(bamfiles) == 0) stop("No BAM files found in this directory!")
+  
+  bam_header <- scanBamHeader(bamfiles[1])
+  true_bam_lengths <- bam_header[[1]]$targets
+  
+  common_chrs <- intersect(seqlevels(GRange_exons), names(true_bam_lengths))
+  seqlevels(GRange_exons, pruning.mode="coarse") <- common_chrs
+  seqlengths(GRange_exons) <- true_bam_lengths[common_chrs]
+  
+  # 3. LOOP THROUGH REPLICATES TO CALCULATE COVERAGE
+  coverage_results_list <- lapply(bamfiles, function(bamfile) {
+    sample_name <- basename(bamfile)
+    message("  -> Processing: ", sample_name)
+    
+    bam.input <- readGAlignments(bamfile, param = ScanBamParam(which = GRange_exons))
+    bam_coverage <- coverage(bam.input)
+    exon_specific_coverage <- bam_coverage[GRange_exons]
+    
+    exon_results <- as.data.frame(GRange_exons) %>%
+      mutate(
+        covered_bases = sum(exon_specific_coverage > 0),
+        exon_length = width
+      )
+    
+    transcript_coverage <- exon_results %>%
+      group_by(gene.id) %>%
+      summarise(
+        total_covered_bases = sum(covered_bases),
+        total_transcript_length = sum(exon_length),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        percent_coverage = total_covered_bases / total_transcript_length,
+        sample_id = sample_name
+      )
+    
+    rm(bam.input, bam_coverage, exon_specific_coverage)
+    gc()
+    
+    return(transcript_coverage)
+  })
+  
+  # 4. COMBINE AND FILTER THE FINAL RESULTS
+  all_coverage <- bind_rows(coverage_results_list)
+  
+  confident_mobile_genes <- all_coverage %>%
+    filter(percent_coverage >= threshold)
+  
+  message("--- Finished! Found ", nrow(confident_mobile_genes), " confident events. ---\n")
+  return(confident_mobile_genes)
+}
+```
+
+### Calculate transcript coverage by GenomicRange
+
+```{r}
+Mobile_RNAs_coverage_length_RSR <- calculate_mobile_coverage(
+  tissue_exon_gff = RSR_mobile_exon_gff, 
+  bam_directory = "E:/RNAseq_SR/Default_Mapping_FilterOut_Primary_inBoth/All_P_alignments/RSR/"
+)
+```
+
+```{r}
+# Save each dataframe as its own CSV file
+write_csv(Mobile_RNAs_coverage_length_RSR, "Mobile_RNAs_coverage_length_RSR.csv")
+```
+
+### Filter coverage > 70% 
+
+```{r}
+# ==========================================================
+#  PROCESS ROOT
+# ==========================================================
+
+# Step A: Pivot the coverage data from long to wide
+RSR_coverage_wide <- Mobile_RNAs_coverage_length_RSR %>%
+  dplyr::select(gene.id, sample_id, percent_coverage) %>%
+  pivot_wider(names_from = sample_id, values_from = percent_coverage)
+
+# Step B: Merge with counts and format the text
+RSR_Final_Table <- Mob_RS_root_1rep %>%
+  left_join(RSR_coverage_wide, by = "gene.id") %>%
+  mutate(across(ends_with(".bam"), 
+                ~ ifelse(is.na(.), "< 0.7", as.character(round(., 7))))) %>%
+  dplyr::select(gene.id, RSR12, RSR21, RSR3, RSR4, RSR12_PrimaryMapped.bam, RSR21_PrimaryMapped.bam, RSR3_PrimaryMapped.bam, RSR4_PrimaryMapped.bam)
+```
+
+### Mobile RNA as 1. clean > 0.01. 2. Length >70% 
+
+```{r}
+# 1. Score the replicates by forcing BOTH conditions to be true
+# ==========================================================
+# 2. SCORE AND FILTER SCION LEAVES (RSB)
+# ==========================================================
+RSR_Scored <- RSR_Final_Table %>%
+  mutate(
+    # Rep 1 must have > 0.01 counts (all best score multi-mapped reads to ruggeri, featureCounts -M allow splite Rug specific read count splite) AND not have failed coverage 
+    Pass_Rep1 = (RSR12 >= 0.01) & (RSR12_PrimaryMapped.bam != "< 0.7"),
+    
+    # Rep 2 must have > 0.01 counts AND not have failed coverage
+    Pass_Rep2 = (RSR21 >= 0.01) & (RSR21_PrimaryMapped.bam != "< 0.7"),
+    
+    # Rep 3 must have > 0.01 counts AND not have failed coverage
+    Pass_Rep3 = (RSR3 >= 0.01) & (RSR3_PrimaryMapped.bam != "< 0.7"),
+    # Rep 3 must have > 0.01 counts AND not have failed coverage
+    Pass_Rep4 = (RSR4 >= 0.01) & (RSR4_PrimaryMapped.bam != "< 0.7"),
+    
+    # Add the TRUE/FALSE values together (TRUE = 1, FALSE = 0)
+    True_Passed_Reps = Pass_Rep1 + Pass_Rep2 + Pass_Rep3 + Pass_Rep4) %>%
+  # Drop the temporary Pass columns to keep the table clean
+  dplyr::select(-Pass_Rep1, -Pass_Rep2, -Pass_Rep3, -Pass_Rep4) %>%
+  # Move the final score to the front
+  relocate(True_Passed_Reps, .after = gene.id)
+
+# Extract confident lists
+df1_RSR_1reps <- RSR_Scored %>%
+  filter(True_Passed_Reps >= 1)
+df2_RSR_2reps <- RSR_Scored %>%
+  filter(True_Passed_Reps >= 2)
+df3_RSR_3reps <- RSR_Scored %>%
+  filter(True_Passed_Reps >= 3)
+df4_RSR_4reps <- RSR_Scored %>%
+  filter(True_Passed_Reps == 4)
+```
+
+### Save the confident mobile transcripts list
+
+```{r}
+# Save each dataframe as its own CSV file
+write_csv(df1_RSR_1reps, "Confident_Mobile_RNAs_RSR1reps.csv")
+write_csv(df2_RSR_2reps, "Confident_Mobile_RNAs_RSR2reps.csv")
+write_csv(df3_RSR_3reps, "Confident_Mobile_RNAs_RSR3reps.csv")
+write_csv(df4_RSR_4reps, "Confident_Mobile_RNAs_RSR4reps.csv")
+```
+
+```{r}
+# 1. Create a clean summary table of your final mobile RNA counts
+RS_Root_mobile_summary <- tibble(
+  Tissue = c("Root (RSR)"),
+  `1rep (>= 1 Reps)` = c(
+    nrow(df1_RSR_1reps)),
+  `2rep (>= 2 Reps)` = c(
+    nrow(df2_RSR_2reps)),
+   `High Confidence (>= 3 Reps)` = c(
+    nrow(df3_RSR_3reps)),
+  `Gold Standard (All 4 Reps)` = c(
+    nrow(df4_RSR_4reps)))
+
+print(RS_Root_mobile_summary)
+```
+
+### Save the number of mobile genes
+
+```{r}
+write_csv(RS_Root_mobile_summary, "RS_Root_mobile_summary.csv")
+```
